@@ -1,0 +1,151 @@
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+name: CI
+
+# Cancel PR actions on new commits
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-20.04-16core
+            target: x86_64-unknown-linux-gnu
+          - os: windows-2022-16core
+            target: x86_64-pc-windows-msvc
+          - os: macOS-latest-xl
+            target: x86_64-apple-darwin
+          - os: ubuntu-20.04-16core
+            target: aarch64-linux-android
+            host: x86_64-unknown-linux-gnu
+    runs-on: ${{ matrix.os }}
+    env:
+      RUSTUP_UNPACK_RAM: "26214400"
+      RUSTUP_IO_THREADS: "1"
+    steps:
+      - uses: actions/checkout@v4
+      # Install the spirv-tools binaries from tarballs hosted on each release
+      # of spirv-tools. This downloads the tarball, decompresses it, unpacks
+      # the binaries to the specified path, and adds them to PATH
+      - name: Install spirv-tools binaries
+        shell: bash
+        run: cargo run --manifest-path .github/install-spirv-tools/Cargo.toml -- ${{matrix.host || matrix.target}} 0.10.0 "${{github.workspace}}/bin"
+      - if: ${{ runner.os == 'Linux' }}
+        name: Linux - Install native dependencies
+        run: sudo apt install libwayland-cursor0 libxkbcommon-dev libwayland-dev
+      # cargo version is a random command that forces the installation of rust-toolchain
+      - name: install rust-toolchain
+        run: cargo version
+      # Fetch dependencies in a separate step to clearly show how long each part
+      # of the testing takes
+      - name: cargo fetch --locked
+        run: cargo fetch --locked --target ${{ matrix.target }}
+
+      # Core crates
+      # Compiled in --release because cargo compiletest would otherwise compile in release again.
+      - name: rustc_codegen_spirv build
+        if: ${{ matrix.target != 'aarch64-linux-android' }}
+        run: cargo test -p rustc_codegen_spirv --release --no-default-features --features "use-installed-tools" --no-run
+
+      - name: rustc_codegen_spirv test
+        if: ${{ matrix.target != 'aarch64-linux-android' }}
+        run: cargo test -p rustc_codegen_spirv --release --no-default-features --features "use-installed-tools"
+
+      - name: compiletest
+        if: ${{ matrix.target != 'aarch64-linux-android' }}
+        run: cargo run -p compiletests --release --no-default-features --features "use-installed-tools" -- --target-env vulkan1.1,vulkan1.2,spv1.3
+
+      - name: workspace test
+        if: ${{ matrix.target != 'aarch64-linux-android' }}
+        run: cargo test --release
+
+      # Examples
+      - name: cargo check examples
+        if: ${{ matrix.target != 'aarch64-linux-android' }}
+        run: cargo check -p example-runner-ash -p example-runner-wgpu -p example-runner-cpu -p compute-shader -p mouse-shader -p simplest-shader -p sky-shader --no-default-features --features "use-installed-tools"
+
+      - name: build example shaders
+        if: ${{ matrix.target != 'aarch64-linux-android' }}
+        env:
+          OUT_DIR: "target/tmp"
+        run: cargo run -p example-runner-wgpu-builder --release --no-default-features --features "use-installed-tools"
+
+      - name: Build WGPU Example for Android
+        if: ${{ matrix.target == 'aarch64-linux-android' }}
+        shell: bash
+        run: |
+          echo "::group::Uninstall android-31"
+          $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager --uninstall "platforms;android-31"
+          echo "::endgroup::"
+
+          echo "::group::Install android-30"
+          $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager --install "platforms;android-30"
+          echo "::endgroup::"
+
+          echo "::group::Install cargo-apk"
+          cargo install cargo-apk
+          echo "::endgroup::"
+
+          echo "::group::Add aarch64-linux-android target"
+          rustup target add aarch64-linux-android
+          echo "::endgroup::"
+
+          echo "::group::Build WGPU example for Android"
+          cargo apk build -p example-runner-wgpu --lib --features use-installed-tools --no-default-features
+          echo "::endgroup::"
+
+  # This just allows us to branch protect on this one job rather needing to change
+  # it if the test matrix changes
+  test_success:
+    runs-on: ubuntu-22.04
+    needs: test
+    steps:
+    - run: echo "All test jobs passed"
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-20.04-16core
+    steps:
+      # Note that we are explicitly NOT checking out submodules, to validate
+      # that we haven't accidentally enabled spirv-tools native compilation
+      # and regressed CI times
+      - uses: actions/checkout@v4
+        with:
+          submodules: "false"
+      - name: Install native dependencies
+        run: sudo apt install libwayland-cursor0 libxkbcommon-dev libwayland-dev
+      - name: Install spirv-tools
+        run: cargo run --manifest-path .github/install-spirv-tools/Cargo.toml -- x86_64-unknown-linux-gnu 0.10.0 "${{github.workspace}}/bin"
+      - name: Install rustup components
+        run: rustup component add rustfmt clippy
+      # cargo version is a random command that forces the installation of rust-toolchain
+      - name: install rust-toolchain
+        run: cargo version
+      - name: cargo fetch --locked
+        run: cargo fetch --locked
+      - name: Rustfmt
+        run: cargo fmt --all -- --check
+      - name: Rustfmt tests
+        run: rustfmt --check tests/ui/**/*.rs
+      - name: Check docs are valid
+        run: RUSTDOCFLAGS=-Dwarnings cargo doc --no-deps
+      - name: Check docs for `spirv-std` and `spirv-builder` on stable (for docs.rs)
+        run: |
+          RUSTDOCFLAGS=-Dwarnings cargo +stable doc --no-deps -p spirv-std
+          RUSTDOCFLAGS=-Dwarnings cargo +stable doc --no-deps -p spirv-builder --no-default-features
+      - name: Clippy & custom lints
+        run: .github/workflows/lint.sh
+
+  cargo-deny:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v1

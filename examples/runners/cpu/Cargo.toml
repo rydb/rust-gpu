@@ -1,0 +1,17 @@
+[package]
+name = "example-runner-cpu"
+version = "0.0.0"
+publish = false
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+minifb = "0.25.0"
+# bring in the shader as natively compiled code
+shared = { path = "../../shaders/shared" }
+sky-shader = { path = "../../shaders/sky-shader" }
+
+# for parallelism, not really needed though
+rayon = "1.5"
